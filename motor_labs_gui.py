@@ -483,12 +483,6 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         <p><b>pi</b>: mathematical constant pi, useful for formulas in radians.</p>
         <p><b>tach_rpm</b>: speed measured by the Qube tachometer channel, in RPM.</p>
 
-        <h3>Typical formula patterns</h3>
-        <p><b>Angle in degrees</b>: <code>counts * 360 / cpr</code></p>
-        <p><b>Angle in radians</b>: <code>counts * 2 * pi / cpr</code></p>
-        <p><b>Speed in RPM</b>: <code>delta_counts / cpr / dt * 60</code></p>
-        <p><b>Speed in rad/s</b>: <code>delta_counts * 2 * pi / cpr / dt</code></p>
-
         <h3>Count mode</h3>
         <p><b>Quadrature x4 (HIL raw)</b>: uses all quadrature transitions reported by the Qube HIL encoder.</p>
         <p><b>Channel change x2</b>: emulates counting both rising/falling changes on one equivalent channel.</p>
