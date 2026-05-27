@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
 from quanser_backend import QuanserConnectionError, QuanserSerialEmulator
@@ -214,12 +214,22 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.last_model = None
         self.last_analysis_text = ""
         self.data = {key: [] for key in ("t", "ref", "meas", "dt_ms", "current", "pwm")}
-        self.instrument = {key: [] for key in ("t", "raw_count", "display_count", "position_deg", "encoder_rpm", "tach_rpm", "filtered_rpm")}
+        self.instrument = {
+            key: []
+            for key in ("t", "raw_count", "display_count", "delta_count", "dt_s", "student_angle", "student_rpm", "encoder_rpm", "tach_rpm", "filtered_rpm")
+        }
         self.monitor_elapsed_s = 0.0
         self.encoder_zero_raw = 0
         self.encoder_last_raw = None
         self.encoder_last_time = None
-        self.marked_counts_per_rev = None
+        self.live_raw_count = 0
+        self.live_delta_raw_count = 0
+        self.live_dt_s = 0.0
+        self.live_encoder_rpm = 0.0
+        self.live_student_angle = None
+        self.live_student_rpm = None
+        self.live_tach_rpm = float("nan")
+        self.live_current = float("nan")
 
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(20)
@@ -255,8 +265,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.lab_list = QtWidgets.QListWidget()
         for lab in LABS:
             self.lab_list.addItem(lab.title)
-        self.lab_list.setMinimumHeight(120)
-        self.lab_list.setMaximumHeight(170)
+        self.lab_list.setMinimumHeight(54)
+        self.lab_list.setMaximumHeight(64)
         left_layout.addWidget(self.lab_list)
 
         hardware_box = QtWidgets.QGroupBox("Hardware")
@@ -272,15 +282,6 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         hardware_layout.addWidget(self.start_button, 1, 0)
         hardware_layout.addWidget(self.stop_button, 1, 1)
         left_layout.addWidget(hardware_box)
-
-        actions = QtWidgets.QHBoxLayout()
-        self.analyze_button = QtWidgets.QPushButton("Analyze")
-        self.export_csv_button = QtWidgets.QPushButton("Export CSV")
-        self.export_report_button = QtWidgets.QPushButton("Export Report")
-        actions.addWidget(self.analyze_button)
-        actions.addWidget(self.export_csv_button)
-        actions.addWidget(self.export_report_button)
-        left_layout.addLayout(actions)
 
         self.settings_tabs = QtWidgets.QTabWidget()
         self.settings_tabs.setDocumentMode(True)
@@ -370,9 +371,17 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.status_label.setObjectName("Status")
         right_layout.addWidget(self.status_label)
 
+        self.output_tabs = QtWidgets.QTabWidget()
+        right_layout.addWidget(self.output_tabs, 1)
+
+        graphs_page = QtWidgets.QWidget()
+        graphs_layout = QtWidgets.QVBoxLayout(graphs_page)
+        graphs_layout.setContentsMargins(0, 0, 0, 0)
+        graphs_layout.setSpacing(8)
+
         plot_splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
         plot_splitter.setChildrenCollapsible(False)
-        right_layout.addWidget(plot_splitter, 1)
+        graphs_layout.addWidget(plot_splitter, 1)
 
         self.response_plot = pg.PlotWidget()
         self.response_plot.addLegend()
@@ -385,13 +394,23 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         plot_splitter.addWidget(self.response_plot)
 
         self.command_plot = pg.PlotWidget()
-        self.command_plot.addLegend()
+        self.command_legend = self.command_plot.addLegend()
         self.command_plot.setLabel("bottom", "Time", units="s")
         self.command_plot.setLabel("left", "Command", units="PWM")
+        self.command_plot.showAxis("right")
+        self.command_plot.setLabel("right", "Current", units="A")
         self.command_plot.showGrid(x=True, y=True, alpha=0.25)
         self.command_plot.setMinimumHeight(90)
         self.pwm_curve = self.command_plot.plot(name="PWM", pen=pg.mkPen("#15803d", width=2))
-        self.current_curve = self.command_plot.plot(name="Current x 50", pen=pg.mkPen("#7c3aed", width=1))
+        self.command_current_view = pg.ViewBox()
+        self.command_plot.scene().addItem(self.command_current_view)
+        self.command_plot.getAxis("right").linkToView(self.command_current_view)
+        self.command_current_view.setXLink(self.command_plot)
+        self.current_curve = pg.PlotDataItem(name="Current", pen=pg.mkPen("#7c3aed", width=1))
+        self.command_current_view.addItem(self.current_curve)
+        self.command_legend.addItem(self.current_curve, "Current")
+        self.command_plot.getViewBox().sigResized.connect(self._update_command_current_view)
+        QtCore.QTimer.singleShot(0, self._update_command_current_view)
         plot_splitter.addWidget(self.command_plot)
 
         self.analysis_plot = pg.PlotWidget()
@@ -402,14 +421,120 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.analysis_plot.setMinimumHeight(120)
         plot_splitter.addWidget(self.analysis_plot)
 
+        results_page = QtWidgets.QWidget()
+        results_layout = QtWidgets.QVBoxLayout(results_page)
+        results_layout.setContentsMargins(8, 8, 8, 8)
+        results_layout.setSpacing(8)
+
+        result_actions = QtWidgets.QHBoxLayout()
+        self.analyze_button = QtWidgets.QPushButton("Analyze")
+        self.export_csv_button = QtWidgets.QPushButton("Export CSV")
+        self.export_report_button = QtWidgets.QPushButton("Export Report")
+        result_actions.addWidget(self.analyze_button)
+        result_actions.addWidget(self.export_csv_button)
+        result_actions.addWidget(self.export_report_button)
+        result_actions.addStretch(1)
+        results_layout.addLayout(result_actions)
+
         self.results = QtWidgets.QTextEdit()
         self.results.setReadOnly(True)
-        self.results.setMinimumHeight(90)
-        plot_splitter.addWidget(self.results)
-        plot_splitter.setSizes([330, 150, 180, 120])
+        self.results.setMinimumHeight(220)
+        results_layout.addWidget(self.results, 1)
+        plot_splitter.setSizes([360, 150, 210])
+
+        self.variables_text = QtWidgets.QTextEdit()
+        self.variables_text.setReadOnly(True)
+        self.variables_text.setHtml(self._variables_reference_html())
+
+        self.output_tabs.addTab(graphs_page, "Graphs")
+        self.output_tabs.addTab(results_page, "Results")
+        self.output_tabs.addTab(self.variables_text, "Variables")
 
         root.addWidget(left)
         root.addWidget(right, 1)
+
+    def _update_command_current_view(self) -> None:
+        if not hasattr(self, "command_current_view"):
+            return
+        vb = self.command_plot.getViewBox()
+        self.command_current_view.setGeometry(vb.sceneBoundingRect())
+        self.command_current_view.linkedViewChanged(vb, self.command_current_view.XAxis)
+
+    def _variables_reference_html(self) -> str:
+        return """
+        <html>
+        <body>
+        <style>
+            body { color: #0f172a; font-size: 12px; line-height: 1.35; }
+            h3 { font-size: 14px; font-weight: 700; margin: 12px 0 6px; }
+            p { margin: 3px 0; }
+            code { font-family: Consolas, monospace; }
+        </style>
+
+        <h3>Encoder formula variables</h3>
+        <p><b>counts</b>: accumulated count since Zero, after applying Direction and Count mode.</p>
+        <p><b>delta_counts</b>: count change between the previous encoder sample and the current sample, after applying Direction and Count mode.</p>
+        <p><b>raw_counts</b>: raw accumulated HIL encoder count since Zero, with Direction applied but without Count mode scaling.</p>
+        <p><b>raw_delta_counts</b>: raw HIL encoder count change between samples, with Direction applied but without Count mode scaling.</p>
+        <p><b>cpr</b>: counts per revolution entered by the student in the CPR field.</p>
+        <p><b>dt</b>: sample time between encoder readings, in seconds.</p>
+        <p><b>dt_ms</b>: sample time between encoder readings, in milliseconds.</p>
+        <p><b>pi</b>: mathematical constant pi, useful for formulas in radians.</p>
+        <p><b>tach_rpm</b>: speed measured by the Qube tachometer channel, in RPM.</p>
+
+        <h3>Typical formula patterns</h3>
+        <p><b>Angle in degrees</b>: <code>counts * 360 / cpr</code></p>
+        <p><b>Angle in radians</b>: <code>counts * 2 * pi / cpr</code></p>
+        <p><b>Speed in RPM</b>: <code>delta_counts / cpr / dt * 60</code></p>
+        <p><b>Speed in rad/s</b>: <code>delta_counts * 2 * pi / cpr / dt</code></p>
+
+        <h3>Count mode</h3>
+        <p><b>Quadrature x4 (HIL raw)</b>: uses all quadrature transitions reported by the Qube HIL encoder.</p>
+        <p><b>Channel change x2</b>: emulates counting both rising/falling changes on one equivalent channel.</p>
+        <p><b>Rising edge x1</b>: emulates counting one edge per pulse.</p>
+        <p><b>Falling edge x1</b>: emulates counting the opposite one-edge convention.</p>
+        <p><b>Custom counts/rev</b>: lets the CPR field define the displayed count scaling.</p>
+
+        <h3>Experiment controls</h3>
+        <p><b>Mode</b>: disabled, open-loop motor command, speed control, or position control.</p>
+        <p><b>Signal</b>: reference generator used during automatic reference operation.</p>
+        <p><b>Duration</b>: run time before the lab stops automatically.</p>
+        <p><b>Sample time</b>: timer interval used by the GUI monitor and command updates.</p>
+        <p><b>Period</b>: reference-signal period.</p>
+        <p><b>Amplitude</b>: reference-signal amplitude.</p>
+        <p><b>Offset</b>: reference-signal vertical offset.</p>
+        <p><b>Manual ref</b>: constant reference used when Automatic reference is unchecked.</p>
+        <p><b>Dead zone</b>: command offset used to overcome motor deadband in closed-loop speed mode.</p>
+
+        <h3>Controller variables</h3>
+        <p><b>Kp</b>: proportional gain.</p>
+        <p><b>Ki</b>: integral gain.</p>
+        <p><b>Kd</b>: derivative gain.</p>
+        <p><b>D filter</b>: derivative-filter time constant used by the backend PID.</p>
+        <p><b>Reset time</b>: anti-windup reset time used by the backend PID.</p>
+        <p><b>PID form</b>: positional or incremental PID implementation.</p>
+        <p><b>A-H</b>: coefficients for the discrete difference-equation controller.</p>
+
+        <h3>Filtering variables</h3>
+        <p><b>Source</b>: signal used as filter input; either encoder-differentiated speed or tachometer speed.</p>
+        <p><b>Moving average window</b>: number of samples averaged by the moving-average filter.</p>
+        <p><b>Moving median window</b>: number of samples used by the moving-median filter.</p>
+        <p><b>Moving average + moving median</b>: combined filter option; the median filter is applied first, then the moving average.</p>
+        <p><b>IIR alpha</b>: exponential-filter coefficient. Higher alpha follows new samples faster; lower alpha smooths more.</p>
+        <p><b>Cutoff rad/s</b>: first-order low-pass cutoff frequency in radians per second.</p>
+        <p><b>Cutoff Hz</b>: cutoff rad/s divided by <code>2*pi</code>.</p>
+        <p><b>Raw std</b>: standard deviation of the selected unfiltered speed source.</p>
+        <p><b>Filtered std</b>: standard deviation after the selected filter.</p>
+        <p><b>Reduction</b>: approximate percent reduction in standard deviation after filtering.</p>
+
+        <h3>Plot signals</h3>
+        <p><b>Reference</b>: command/reference generated by the selected lab setup.</p>
+        <p><b>Measured</b>: backend speed or position measurement returned by the Qube adapter.</p>
+        <p><b>PWM</b>: controller command scaled in the old OpenMCT PWM convention.</p>
+        <p><b>Current</b>: measured motor current shown on the command plot right axis.</p>
+        </body>
+        </html>
+        """
 
     def _build_encoder_tab(self) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget()
@@ -428,16 +553,21 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         ])
         self.encoder_direction = QtWidgets.QComboBox()
         self.encoder_direction.addItems(["Hardware sign", "Invert sign"])
-        self.encoder_expected_cpr = self._spin(1, 100000, QUADRATURE_COUNTS_PER_REV)
-        self.encoder_custom_cpr = self._spin(1, 100000, QUADRATURE_COUNTS_PER_REV)
-        self.encoder_formula = QtWidgets.QLineEdit("counts * 360 / counts_per_rev")
-        self.encoder_formula.setToolTip("Safe expression. Variables: counts, raw_counts, counts_per_rev, pi, rpm.")
+        self.encoder_cpr = QtWidgets.QLineEdit()
+        self.encoder_cpr.setPlaceholderText("students compute")
+        self.encoder_cpr.setValidator(QtGui.QDoubleValidator(0.0, 1000000.0, 6, self))
+        self.encoder_formula = QtWidgets.QLineEdit()
+        self.encoder_formula.setPlaceholderText("angle expression")
+        self.encoder_formula.setToolTip("Variables: counts, delta_counts, raw_counts, raw_delta_counts, cpr, dt, dt_ms, pi, tach_rpm.")
+        self.speed_formula = QtWidgets.QLineEdit()
+        self.speed_formula.setPlaceholderText("speed expression in RPM")
+        self.speed_formula.setToolTip("Variables: counts, delta_counts, raw_counts, raw_delta_counts, cpr, dt, dt_ms, pi, tach_rpm.")
         rows = [
             ("Count mode", self.encoder_edge_mode),
             ("Direction", self.encoder_direction),
-            ("Expected CPR", self.encoder_expected_cpr),
-            ("Custom CPR", self.encoder_custom_cpr),
+            ("CPR", self.encoder_cpr),
             ("Angle formula", self.encoder_formula),
+            ("Speed formula", self.speed_formula),
         ]
         for row, (label, widget) in enumerate(rows):
             controls.addWidget(QtWidgets.QLabel(label), row, 0)
@@ -446,10 +576,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
         buttons = QtWidgets.QHBoxLayout()
         self.encoder_zero_button = QtWidgets.QPushButton("Zero")
-        self.encoder_mark_button = QtWidgets.QPushButton("Mark 1 rev")
-        self.encoder_eval_button = QtWidgets.QPushButton("Eval formula")
+        self.encoder_eval_button = QtWidgets.QPushButton("Eval formulas")
         buttons.addWidget(self.encoder_zero_button)
-        buttons.addWidget(self.encoder_mark_button)
         buttons.addWidget(self.encoder_eval_button)
         layout.addLayout(buttons)
 
@@ -458,13 +586,12 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         for row, key in enumerate([
             "raw_count",
             "display_count",
-            "angle_deg",
-            "angle_rad",
-            "encoder_rpm",
+            "delta_count",
+            "dt_ms",
             "tach_rpm",
-            "measured_cpr",
             "direction",
             "student_angle",
+            "student_rpm",
         ]):
             label = QtWidgets.QLabel(key.replace("_", " ").title())
             value = self._readout_label()
@@ -484,14 +611,24 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.filter_source = QtWidgets.QComboBox()
         self.filter_source.addItems(["Encoder diff speed", "Tachometer speed"])
         self.filter_type = QtWidgets.QComboBox()
-        self.filter_type.addItems(["Moving average", "Exponential IIR", "First-order low-pass", "No filter"])
+        self.filter_type.addItems([
+            "Moving average",
+            "Moving median",
+            "Moving average + moving median",
+            "Exponential IIR",
+            "First-order low-pass",
+            "No filter",
+        ])
         self.filter_window = self._spin(1, 201, 9)
+        self.filter_median_window = QtWidgets.QLineEdit("9")
+        self.filter_median_window.setValidator(QtGui.QIntValidator(1, 201, self))
         self.filter_alpha = self._double_spin(0.001, 1.0, 0.2, decimals=4, step=0.01)
         self.filter_cutoff = self._double_spin(0.01, 1000.0, 50.0, decimals=3, step=1.0)
         rows = [
             ("Source", self.filter_source),
             ("Filter", self.filter_type),
             ("MA window", self.filter_window),
+            ("Median window", self.filter_median_window),
             ("IIR alpha", self.filter_alpha),
             ("Cutoff rad/s", self.filter_cutoff),
         ]
@@ -596,15 +733,17 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.export_csv_button.clicked.connect(self.export_csv)
         self.export_report_button.clicked.connect(self.export_report)
         self.encoder_zero_button.clicked.connect(self.zero_encoder_counter)
-        self.encoder_mark_button.clicked.connect(self.mark_one_revolution)
         self.encoder_eval_button.clicked.connect(self.evaluate_encoder_formula)
         self.encoder_edge_mode.currentIndexChanged.connect(self._on_encoder_count_mode_changed)
         self.encoder_direction.currentIndexChanged.connect(self._refresh_instrumentation_display)
-        self.encoder_expected_cpr.valueChanged.connect(self._refresh_instrumentation_display)
-        self.encoder_custom_cpr.valueChanged.connect(self._refresh_instrumentation_display)
+        self.encoder_cpr.textChanged.connect(self._refresh_instrumentation_display)
+        self.encoder_formula.textChanged.connect(self._refresh_instrumentation_display)
+        self.speed_formula.textChanged.connect(self._refresh_instrumentation_display)
+        self.instrument_tabs.currentChanged.connect(self._refresh_instrumentation_display)
         self.filter_source.currentIndexChanged.connect(self._refresh_filter_display)
         self.filter_type.currentIndexChanged.connect(self._refresh_filter_display)
         self.filter_window.valueChanged.connect(self._refresh_filter_display)
+        self.filter_median_window.textChanged.connect(self._refresh_filter_display)
         self.filter_alpha.valueChanged.connect(self._refresh_filter_display)
         self.filter_cutoff.valueChanged.connect(self._refresh_filter_display)
 
@@ -690,7 +829,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.release_button.setEnabled(True)
         self.timer.setInterval(max(5, self.delay.value()))
         self.timer.start()
-        self.status_label.setText("Quanser Qube connected; motor output is disabled")
+        self.status_label.setText("Quanser Qube connected; encoder monitor is active")
 
     def release_hardware(self) -> None:
         self.stop_lab()
@@ -717,6 +856,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.stop_button.setEnabled(True)
         self.start_button.setEnabled(False)
         self._update_axis_labels()
+        self.output_tabs.setCurrentIndex(0)
         self._send_command(start=True)
         self.timer.setInterval(max(5, self.delay.value()))
         self.timer.start()
@@ -724,6 +864,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
     def stop_lab(self) -> None:
         self.running = False
+        self.timer.stop()
         if self.qube is not None and getattr(self.qube, "is_open", False):
             try:
                 self._send_command(start=False)
@@ -734,9 +875,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         if self.qube is not None:
-            if not self.timer.isActive():
-                self.timer.setInterval(max(5, self.delay.value()))
-                self.timer.start()
+            self.timer.setInterval(max(5, self.delay.value()))
+            self.timer.start()
             self.status_label.setText("Stopped; motor output is disabled")
 
     def clear_data(self) -> None:
@@ -747,6 +887,11 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.monitor_elapsed_s = 0.0
         self.encoder_last_raw = None
         self.encoder_last_time = None
+        self.live_encoder_rpm = 0.0
+        self.live_delta_raw_count = 0
+        self.live_dt_s = 0.0
+        self.live_student_angle = None
+        self.live_student_rpm = None
         self.last_analysis_text = ""
         self.reference_curve.setData([], [])
         self.measured_curve.setData([], [])
@@ -794,18 +939,20 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return
 
         try:
-            self._send_command(start=self.running)
-            while self.qube.in_waiting:
-                line = self.qube.readline().decode("utf-8", errors="ignore").strip()
-                self._append_line(line)
+            if self.running:
+                self._send_command(start=True)
+                while self.qube.in_waiting:
+                    line = self.qube.readline().decode("utf-8", errors="ignore").strip()
+                    self._append_line(line)
             if hasattr(self.qube, "read_encoder_snapshot"):
-                self._append_encoder_snapshot(self.qube.read_encoder_snapshot())
+                self._append_encoder_snapshot(self.qube.read_encoder_snapshot(), record=self.running)
         except Exception as exc:
             self.status_label.setText(f"Qube communication error: {exc}")
             self.release_hardware()
             return
 
-        self._update_plots()
+        if self.running:
+            self._update_plots()
         self._refresh_instrumentation_display()
         if self.running and self.elapsed_s >= self.duration.value():
             self.stop_lab()
@@ -829,29 +976,54 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.data["current"].append(current)
         self.data["pwm"].append(pwm)
 
-    def _append_encoder_snapshot(self, snapshot: dict[str, float | int | bool]) -> None:
+    def _append_encoder_snapshot(self, snapshot: dict[str, float | int | bool], record: bool = True) -> None:
         raw_count = int(snapshot.get("encoder0_count", 0))
         interval_s = max(self.timer.interval(), 1) * 1e-3
         if self.encoder_last_raw is None:
+            raw_delta = 0
             encoder_rpm = 0.0
             self.encoder_last_time = self.monitor_elapsed_s
         else:
             dt = max(self.monitor_elapsed_s - float(self.encoder_last_time), interval_s, 1e-6)
-            encoder_rpm = (raw_count - int(self.encoder_last_raw)) / QUADRATURE_COUNTS_PER_REV * 60.0 / dt
+            raw_delta = raw_count - int(self.encoder_last_raw)
+            encoder_rpm = raw_delta / QUADRATURE_COUNTS_PER_REV * 60.0 / dt
         self.monitor_elapsed_s += interval_s
         self.encoder_last_raw = raw_count
         self.encoder_last_time = self.monitor_elapsed_s
 
+        self.live_raw_count = raw_count
+        self.live_delta_raw_count = raw_delta
+        self.live_dt_s = interval_s
+        self.live_encoder_rpm = encoder_rpm
+        snapshot_tach_rpm = float(snapshot.get("tach0_rpm", float("nan")))
+        if record and self.current_mode() in (1, 2) and self.data["meas"]:
+            self.live_tach_rpm = float(self.data["meas"][-1])
+        else:
+            self.live_tach_rpm = snapshot_tach_rpm
+        self.live_current = float(snapshot.get("current_a", float("nan")))
+        try:
+            self.live_student_angle = self._evaluate_student_angle()
+        except Exception:
+            self.live_student_angle = None
+        try:
+            self.live_student_rpm = self._evaluate_student_speed()
+        except Exception:
+            self.live_student_rpm = None
+        if not record:
+            return
+
         display_count = self._display_count_from_raw(raw_count)
-        position_deg = display_count * 360.0 / max(float(self.encoder_expected_cpr.value()), 1.0)
-        tach_rpm = float(snapshot.get("tach0_rpm", float("nan")))
+        display_delta = self._display_delta_from_raw(raw_delta)
 
         self.instrument["t"].append(self.monitor_elapsed_s)
         self.instrument["raw_count"].append(raw_count)
         self.instrument["display_count"].append(display_count)
-        self.instrument["position_deg"].append(position_deg)
-        self.instrument["encoder_rpm"].append(self._direction_sign() * encoder_rpm)
-        self.instrument["tach_rpm"].append(tach_rpm)
+        self.instrument["delta_count"].append(display_delta)
+        self.instrument["dt_s"].append(interval_s)
+        self.instrument["student_angle"].append(float("nan") if self.live_student_angle is None else self.live_student_angle)
+        self.instrument["student_rpm"].append(float("nan") if self.live_student_rpm is None else self.live_student_rpm)
+        self.instrument["encoder_rpm"].append(encoder_rpm)
+        self.instrument["tach_rpm"].append(self.live_tach_rpm)
         self.instrument["filtered_rpm"].append(float("nan"))
 
         max_samples = 6000
@@ -870,56 +1042,77 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return 0.5
         if mode in (2, 3):
             return 0.25
-        return float(self.encoder_custom_cpr.value()) / float(QUADRATURE_COUNTS_PER_REV)
+        cpr = self._current_cpr()
+        return (cpr / float(QUADRATURE_COUNTS_PER_REV)) if cpr is not None else 1.0
 
     def _display_count_from_raw(self, raw_count: int) -> float:
         return self._direction_sign() * (float(raw_count) - float(self.encoder_zero_raw)) * self._display_scale()
 
+    def _display_delta_from_raw(self, raw_delta: int) -> float:
+        return self._direction_sign() * float(raw_delta) * self._display_scale()
+
+    def _current_cpr(self) -> float | None:
+        text = self.encoder_cpr.text().strip().replace(",", ".")
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
     def _on_encoder_count_mode_changed(self) -> None:
-        defaults = {
-            0: QUADRATURE_COUNTS_PER_REV,
-            1: QUADRATURE_COUNTS_PER_REV // 2,
-            2: QUADRATURE_COUNTS_PER_REV // 4,
-            3: QUADRATURE_COUNTS_PER_REV // 4,
-            4: self.encoder_custom_cpr.value(),
-        }
-        self.encoder_expected_cpr.setValue(defaults.get(self.encoder_edge_mode.currentIndex(), QUADRATURE_COUNTS_PER_REV))
         self._refresh_instrumentation_display()
 
     def zero_encoder_counter(self) -> None:
-        if self.instrument["raw_count"]:
-            self.encoder_zero_raw = int(self.instrument["raw_count"][-1])
-        else:
-            self.encoder_zero_raw = 0
-        self.marked_counts_per_rev = None
-        self._refresh_instrumentation_display()
-
-    def mark_one_revolution(self) -> None:
-        if not self.instrument["raw_count"]:
-            self.results.setPlainText("Connect the Qube first, zero the encoder, rotate one revolution, then press Mark 1 rev.")
-            return
-        self.marked_counts_per_rev = abs(self._display_count_from_raw(int(self.instrument["raw_count"][-1])))
+        self.encoder_zero_raw = int(self.live_raw_count)
         self._refresh_instrumentation_display()
 
     def evaluate_encoder_formula(self) -> None:
         try:
-            result = self._student_angle_value()
-            self.encoder_readouts["student_angle"].setText(f"{result:.6g}")
+            self.live_student_angle = self._evaluate_student_angle()
+            self.encoder_readouts["student_angle"].setText("--" if self.live_student_angle is None else f"{self.live_student_angle:.6g}")
         except Exception as exc:
+            self.live_student_angle = None
             self.encoder_readouts["student_angle"].setText(f"error: {exc}")
 
-    def _student_angle_value(self) -> float:
-        raw_count = int(self.instrument["raw_count"][-1]) if self.instrument["raw_count"] else 0
-        counts = self._display_count_from_raw(raw_count)
-        rpm = float(self.instrument["encoder_rpm"][-1]) if self.instrument["encoder_rpm"] else 0.0
+        try:
+            self.live_student_rpm = self._evaluate_student_speed()
+            self.encoder_readouts["student_rpm"].setText("--" if self.live_student_rpm is None else f"{self.live_student_rpm:.6g}")
+        except Exception as exc:
+            self.live_student_rpm = None
+            self.encoder_readouts["student_rpm"].setText(f"error: {exc}")
+
+    def _formula_variables(self) -> dict[str, float]:
+        raw_delta = self._direction_sign() * float(self.live_delta_raw_count)
+        raw_counts = self._direction_sign() * float(int(self.live_raw_count) - self.encoder_zero_raw)
+        cpr = self._current_cpr()
         variables = {
-            "counts": counts,
-            "raw_counts": float(raw_count - self.encoder_zero_raw),
-            "counts_per_rev": float(self.encoder_expected_cpr.value()),
+            "counts": self._display_count_from_raw(int(self.live_raw_count)),
+            "delta_counts": self._display_delta_from_raw(int(self.live_delta_raw_count)),
+            "raw_counts": raw_counts,
+            "raw_delta_counts": raw_delta,
+            "cpr": float("nan") if cpr is None else cpr,
+            "dt": max(float(self.live_dt_s), 1e-9),
+            "dt_ms": max(float(self.live_dt_s), 1e-9) * 1000.0,
             "pi": math.pi,
-            "rpm": rpm,
+            "tach_rpm": float(self.live_tach_rpm),
         }
-        return float(self._safe_eval_expression(self.encoder_formula.text(), variables))
+        return variables
+
+    def _evaluate_student_angle(self) -> float | None:
+        expression = self.encoder_formula.text().strip()
+        if not expression:
+            return None
+        value = float(self._safe_eval_expression(expression, self._formula_variables()))
+        return value if np.isfinite(value) else None
+
+    def _evaluate_student_speed(self) -> float | None:
+        expression = self.speed_formula.text().strip()
+        if not expression:
+            return None
+        value = float(self._safe_eval_expression(expression, self._formula_variables()))
+        return value if np.isfinite(value) else None
 
     def _safe_eval_expression(self, expression: str, variables: dict[str, float]) -> float:
         tree = ast.parse(expression, mode="eval")
@@ -955,9 +1148,10 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         return eval_node(tree)
 
     def _instrument_arrays(self):
+        encoder_rpm = np.asarray(self.instrument["encoder_rpm"], dtype=float)
         return (
             np.asarray(self.instrument["t"], dtype=float),
-            np.asarray(self.instrument["encoder_rpm"], dtype=float),
+            self._direction_sign() * encoder_rpm,
             np.asarray(self.instrument["tach_rpm"], dtype=float),
         )
 
@@ -966,6 +1160,14 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         if self.filter_source.currentIndex() == 1:
             return tach_rpm, "Tachometer"
         return encoder_rpm, "Encoder diff"
+
+    def _median_window_value(self) -> int:
+        text = self.filter_median_window.text().strip()
+        try:
+            value = int(text)
+        except ValueError:
+            return 1
+        return max(1, min(value, 201))
 
     def _apply_selected_filter(self, t: np.ndarray, values: np.ndarray) -> np.ndarray:
         values = np.asarray(values, dtype=float)
@@ -977,6 +1179,11 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return clean.copy()
         if filter_name == "Moving average":
             return self._moving_average(clean, self.filter_window.value())
+        if filter_name == "Moving median":
+            return self._moving_median(clean, self._median_window_value())
+        if filter_name == "Moving average + moving median":
+            median_filtered = self._moving_median(clean, self._median_window_value())
+            return self._moving_average(median_filtered, self.filter_window.value())
         if filter_name == "Exponential IIR":
             alpha = float(self.filter_alpha.value())
             out = np.empty_like(clean)
@@ -994,38 +1201,66 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             out[idx] = out[idx - 1] + alpha * (clean[idx] - out[idx - 1])
         return out
 
+    def _is_instrumentation_lab(self) -> bool:
+        return self.current_lab().analysis in ("interfacing", "filtering")
+
+    def _plot_live_encoder_analysis(self) -> None:
+        t = np.asarray(self.instrument["t"], dtype=float)
+        if t.size < 2:
+            return
+        tach_rpm = np.asarray(self.instrument["tach_rpm"], dtype=float)
+        student_rpm = np.asarray(self.instrument["student_rpm"], dtype=float)
+        self.analysis_plot.clear()
+        self.analysis_plot.setLabel("left", "Speed", units="RPM")
+        self.analysis_plot.setLabel("bottom", "Time", units="s")
+        if tach_rpm.size == t.size and np.any(np.isfinite(tach_rpm)):
+            self.analysis_plot.plot(t, tach_rpm, name="Tachometer RPM", pen=pg.mkPen("#f97316", width=2))
+        if student_rpm.size == t.size and np.any(np.isfinite(student_rpm)):
+            self.analysis_plot.plot(t, student_rpm, name="Formula RPM", pen=pg.mkPen("#2563eb", width=2))
+
+    def _plot_live_filter_analysis(self, t: np.ndarray, values: np.ndarray, filtered: np.ndarray, source_name: str) -> None:
+        self.analysis_plot.clear()
+        self.analysis_plot.setLabel("left", "Speed", units="RPM")
+        self.analysis_plot.setLabel("bottom", "Time", units="s")
+        self.analysis_plot.plot(t, values, name=f"{source_name} raw", pen=pg.mkPen("#94a3b8", width=1))
+        self.analysis_plot.plot(t, filtered, name=self.filter_type.currentText(), pen=pg.mkPen("#2563eb", width=2))
+        if source_name != "Tachometer":
+            tach = np.asarray(self.instrument["tach_rpm"], dtype=float)
+            if tach.size == t.size and np.any(np.isfinite(tach)):
+                self.analysis_plot.plot(t, tach, name="Tachometer", pen=pg.mkPen("#f97316", width=2))
+
     def _refresh_instrumentation_display(self) -> None:
         if not hasattr(self, "encoder_readouts"):
             return
-        raw_count = int(self.instrument["raw_count"][-1]) if self.instrument["raw_count"] else self.encoder_zero_raw
+        raw_count = int(self.live_raw_count)
         display_count = self._display_count_from_raw(raw_count)
-        angle_deg = display_count * 360.0 / max(float(self.encoder_expected_cpr.value()), 1.0)
-        angle_rad = angle_deg * math.pi / 180.0
-        encoder_rpm = float(self.instrument["encoder_rpm"][-1]) if self.instrument["encoder_rpm"] else 0.0
-        tach_rpm = float(self.instrument["tach_rpm"][-1]) if self.instrument["tach_rpm"] else float("nan")
+        delta_count = self._display_delta_from_raw(int(self.live_delta_raw_count))
+        encoder_rpm = self._direction_sign() * float(self.live_encoder_rpm)
+        tach_rpm = float(self.live_tach_rpm)
         direction = "positive" if display_count > 0 else "negative" if display_count < 0 else "zero"
-        measured = "--"
-        if self.marked_counts_per_rev is not None:
-            expected = max(float(self.encoder_expected_cpr.value()), 1.0)
-            error_pct = 100.0 * (self.marked_counts_per_rev - expected) / expected
-            measured = f"{self.marked_counts_per_rev:.1f} ({error_pct:+.2f}%)"
+        try:
+            self.live_student_angle = self._evaluate_student_angle()
+        except Exception:
+            self.live_student_angle = None
+        try:
+            self.live_student_rpm = self._evaluate_student_speed()
+        except Exception:
+            self.live_student_rpm = None
         values = {
             "raw_count": f"{raw_count:d}",
             "display_count": f"{display_count:.1f}",
-            "angle_deg": f"{angle_deg:.3f}",
-            "angle_rad": f"{angle_rad:.5f}",
-            "encoder_rpm": f"{encoder_rpm:.2f}",
+            "delta_count": f"{delta_count:.1f}",
+            "dt_ms": f"{self.live_dt_s * 1000.0:.3f}",
             "tach_rpm": f"{tach_rpm:.2f}" if np.isfinite(tach_rpm) else "--",
-            "measured_cpr": measured,
             "direction": direction,
+            "student_angle": "--" if self.live_student_angle is None else f"{self.live_student_angle:.6g}",
+            "student_rpm": "--" if self.live_student_rpm is None else f"{self.live_student_rpm:.6g}",
         }
         for key, text in values.items():
             self.encoder_readouts[key].setText(text)
-        try:
-            self.encoder_readouts["student_angle"].setText(f"{self._student_angle_value():.6g}")
-        except Exception:
-            pass
         self._refresh_filter_display()
+        if self._is_instrumentation_lab() and self.instrument_tabs.currentIndex() == 0:
+            self._plot_live_encoder_analysis()
 
     def _refresh_filter_display(self) -> None:
         if not hasattr(self, "cutoff_hz_label"):
@@ -1048,16 +1283,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.raw_noise_label.setText(f"{raw_std:.3f} RPM")
         self.filtered_noise_label.setText(f"{filtered_std:.3f} RPM")
         self.noise_reduction_label.setText(f"{reduction:.1f}%")
-        if self.current_lab().analysis == "filtering":
-            self.analysis_plot.clear()
-            self.analysis_plot.setLabel("left", "Speed", units="RPM")
-            self.analysis_plot.setLabel("bottom", "Time", units="s")
-            self.analysis_plot.plot(t, values, name=f"{source_name} raw", pen=pg.mkPen("#94a3b8", width=1))
-            self.analysis_plot.plot(t, filtered, name=self.filter_type.currentText(), pen=pg.mkPen("#2563eb", width=2))
-            if source_name != "Tachometer":
-                tach = np.asarray(self.instrument["tach_rpm"], dtype=float)
-                if tach.size == t.size and np.any(np.isfinite(tach)):
-                    self.analysis_plot.plot(t, tach, name="Tachometer", pen=pg.mkPen("#f97316", width=2))
+        if self._is_instrumentation_lab() and self.instrument_tabs.currentIndex() == 1:
+            self._plot_live_filter_analysis(t, values, filtered, source_name)
 
     def _update_axis_labels(self) -> None:
         mode = self.current_mode()
@@ -1085,7 +1312,16 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.reference_curve.setData(t, ref)
         self.measured_curve.setData(t, meas)
         self.pwm_curve.setData(t, pwm)
-        self.current_curve.setData(t, current * 50.0)
+        self.current_curve.setData(t, current)
+        finite_current = current[np.isfinite(current)]
+        if finite_current.size:
+            cmin = float(np.min(finite_current))
+            cmax = float(np.max(finite_current))
+            if abs(cmax - cmin) < 1e-9:
+                margin = max(0.05, abs(cmax) * 0.2)
+            else:
+                margin = 0.15 * (cmax - cmin)
+            self.command_current_view.setYRange(cmin - margin, cmax + margin, padding=0)
 
     def _arrays(self):
         return (
@@ -1102,11 +1338,13 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             text = self._analyze_interfacing()
             self.last_analysis_text = text
             self.results.setPlainText(text)
+            self.output_tabs.setCurrentIndex(1)
             return
         if lab.analysis == "filtering" and len(self.instrument["t"]) >= 5:
             text = self._analyze_filtering()
             self.last_analysis_text = text
             self.results.setPlainText(text)
+            self.output_tabs.setCurrentIndex(1)
             return
         if t.size < 5:
             self.results.setPlainText("Not enough samples yet. Run the lab before analyzing.")
@@ -1134,6 +1372,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             text = self._analyze_summary(t, ref, meas, pwm)
         self.last_analysis_text = text
         self.results.setPlainText(text)
+        self.output_tabs.setCurrentIndex(1)
 
     def _analyze_summary(self, t, ref, meas, pwm) -> str:
         return "\n".join(
@@ -1152,27 +1391,38 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         kernel = np.ones(window) / window
         return np.convolve(values, kernel, mode="same")
 
+    def _moving_median(self, values, window: int):
+        values = np.asarray(values, dtype=float)
+        if values.size == 0:
+            return values
+        window = max(1, min(int(window), values.size))
+        half_window = window // 2
+        filtered = np.empty_like(values)
+        for idx in range(values.size):
+            start = max(0, idx - half_window)
+            end = min(values.size, start + window)
+            start = max(0, end - window)
+            filtered[idx] = float(np.median(values[start:end]))
+        return filtered
+
     def _analyze_interfacing(self) -> str:
         raw_count = int(self.instrument["raw_count"][-1]) if self.instrument["raw_count"] else self.encoder_zero_raw
         display_count = self._display_count_from_raw(raw_count)
-        expected = max(float(self.encoder_expected_cpr.value()), 1.0)
-        deg_gain = 360.0 / expected
-        rad_gain = 2.0 * math.pi / expected
-        measured = "not marked"
-        if self.marked_counts_per_rev is not None:
-            error_pct = 100.0 * (self.marked_counts_per_rev - expected) / expected
-            measured = f"{self.marked_counts_per_rev:.1f} counts/rev ({error_pct:+.2f}% vs expected)"
         positive_direction = "positive count direction" if display_count >= 0 else "negative count direction"
+        cpr = self._current_cpr()
         return "\n".join(
             [
                 "Interfacing analysis",
                 f"Selected count mode: {self.encoder_edge_mode.currentText()}",
+                f"Student CPR: {'blank' if cpr is None else f'{cpr:.6g}'}",
+                f"Angle formula: {self.encoder_formula.text().strip() or 'blank'}",
+                f"Speed formula: {self.speed_formula.text().strip() or 'blank'}",
                 f"Raw HIL encoder count: {raw_count}",
                 f"Displayed count since Zero: {display_count:.1f}",
-                f"Expected counts/rev: {expected:.1f}",
-                f"Measured one-revolution count: {measured}",
-                f"Gain to degrees: {deg_gain:.9g} deg/count",
-                f"Gain to radians: {rad_gain:.9g} rad/count",
+                f"Last delta count: {self._display_delta_from_raw(int(self.live_delta_raw_count)):.1f}",
+                f"Last dt: {self.live_dt_s:.6g} s",
+                f"Student angle output: {'--' if self.live_student_angle is None else f'{self.live_student_angle:.6g}'}",
+                f"Student speed output: {'--' if self.live_student_rpm is None else f'{self.live_student_rpm:.6g}'}",
                 f"Current sign observation: {positive_direction}",
                 "When the Quanser backend is reopened, the HIL encoder count is zeroed by software; students should notice that restart changes the reference origin.",
             ]
@@ -1191,20 +1441,18 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         residual_std = float(np.std(np.nan_to_num(values - filtered))) if values.size == filtered.size else 0.0
         reduction = 100.0 * (1.0 - filtered_std / raw_std) if raw_std > 1e-9 else 0.0
         cutoff_hz = float(self.filter_cutoff.value()) / (2.0 * math.pi)
-        self.analysis_plot.clear()
-        self.analysis_plot.setLabel("left", "Speed", units="RPM")
-        self.analysis_plot.setLabel("bottom", "Time", units="s")
-        self.analysis_plot.plot(t, values, name=f"{source_name} raw", pen=pg.mkPen("#94a3b8", width=1))
-        self.analysis_plot.plot(t, filtered, name=self.filter_type.currentText(), pen=pg.mkPen("#2563eb", width=2))
-        tach = np.asarray(self.instrument["tach_rpm"], dtype=float)
-        if tach.size == t.size and np.any(np.isfinite(tach)) and source_name != "Tachometer":
-            self.analysis_plot.plot(t, tach, name="Tachometer", pen=pg.mkPen("#f97316", width=2))
+        self._plot_live_filter_analysis(t, values, filtered, source_name)
+        order_note = ""
+        if self.filter_type.currentText() == "Moving average + moving median":
+            order_note = "Combined filter order: moving median first, then moving average."
         return "\n".join(
-            [
+            [line for line in [
                 "Filtering analysis",
                 f"Source: {source_name}",
                 f"Filter: {self.filter_type.currentText()}",
                 f"Moving-average window: {self.filter_window.value()} samples",
+                f"Moving-median window: {self._median_window_value()} samples",
+                order_note,
                 f"Exponential alpha: {self.filter_alpha.value():.4f}",
                 f"Low-pass cutoff: {self.filter_cutoff.value():.4g} rad/s = {cutoff_hz:.4g} Hz",
                 f"Raw standard deviation: {raw_std:.3f} RPM",
@@ -1212,7 +1460,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
                 f"Raw-filter residual std: {residual_std:.3f} RPM",
                 f"Std reduction estimate: {reduction:.1f}%",
                 "Lower cutoff/windowed filters reduce noise but add lag and attenuate fast changes; higher cutoff follows motion faster but leaves more quantization noise.",
-            ]
+            ] if line]
         )
 
     def _step_segment(self, t, ref, meas):
@@ -1496,12 +1744,28 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             for row in zip(self.data["t"], self.data["ref"], self.data["meas"], self.data["dt_ms"], self.data["current"], self.data["pwm"]):
                 writer.writerow(["control", self.current_lab().title, *row])
             writer.writerow([])
-            writer.writerow(["section", "lab", "time_s", "raw_count", "display_count", "position_deg", "encoder_rpm", "tach_rpm", "filtered_rpm"])
+            writer.writerow([
+                "section",
+                "lab",
+                "time_s",
+                "raw_count",
+                "display_count",
+                "delta_count",
+                "dt_s",
+                "student_angle",
+                "student_rpm",
+                "encoder_diff_rpm_internal",
+                "tach_rpm",
+                "filtered_rpm",
+            ])
             for row in zip(
                 self.instrument["t"],
                 self.instrument["raw_count"],
                 self.instrument["display_count"],
-                self.instrument["position_deg"],
+                self.instrument["delta_count"],
+                self.instrument["dt_s"],
+                self.instrument["student_angle"],
+                self.instrument["student_rpm"],
                 self.instrument["encoder_rpm"],
                 self.instrument["tach_rpm"],
                 self.instrument["filtered_rpm"],
@@ -1531,10 +1795,11 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             f"Period: {self.period.value()} ms",
             f"Kp/Ki/Kd: {self.kp.value()} / {self.ki.value()} / {self.kd.value()}",
             f"Encoder count mode: {self.encoder_edge_mode.currentText()}",
-            f"Expected counts/rev: {self.encoder_expected_cpr.value()}",
-            f"Encoder formula: {self.encoder_formula.text()}",
+            f"Student CPR: {self.encoder_cpr.text().strip() or 'blank'}",
+            f"Angle formula: {self.encoder_formula.text().strip() or 'blank'}",
+            f"Speed formula: {self.speed_formula.text().strip() or 'blank'}",
             f"Filter source/type: {self.filter_source.currentText()} / {self.filter_type.currentText()}",
-            f"Filter window/alpha/cutoff: {self.filter_window.value()} / {self.filter_alpha.value()} / {self.filter_cutoff.value()} rad/s",
+            f"Filter windows/alpha/cutoff: MA {self.filter_window.value()} / median {self._median_window_value()} / alpha {self.filter_alpha.value()} / cutoff {self.filter_cutoff.value()} rad/s",
             "",
             "Analysis:",
             self.last_analysis_text or self.results.toPlainText() or "No analysis has been run.",
