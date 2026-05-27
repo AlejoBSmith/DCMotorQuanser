@@ -4,6 +4,7 @@ import ast
 import csv
 import math
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -978,22 +979,23 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
     def _append_encoder_snapshot(self, snapshot: dict[str, float | int | bool], record: bool = True) -> None:
         raw_count = int(snapshot.get("encoder0_count", 0))
-        interval_s = max(self.timer.interval(), 1) * 1e-3
-        if self.encoder_last_raw is None:
+        nominal_interval_s = max(self.timer.interval(), 1) * 1e-3
+        now_s = time.monotonic()
+        if self.encoder_last_raw is None or self.encoder_last_time is None:
             raw_delta = 0
             encoder_rpm = 0.0
-            self.encoder_last_time = self.monitor_elapsed_s
+            dt = nominal_interval_s
         else:
-            dt = max(self.monitor_elapsed_s - float(self.encoder_last_time), interval_s, 1e-6)
+            dt = max(now_s - float(self.encoder_last_time), 1e-6)
             raw_delta = raw_count - int(self.encoder_last_raw)
             encoder_rpm = raw_delta / QUADRATURE_COUNTS_PER_REV * 60.0 / dt
-        self.monitor_elapsed_s += interval_s
+        self.monitor_elapsed_s += dt
         self.encoder_last_raw = raw_count
-        self.encoder_last_time = self.monitor_elapsed_s
+        self.encoder_last_time = now_s
 
         self.live_raw_count = raw_count
         self.live_delta_raw_count = raw_delta
-        self.live_dt_s = interval_s
+        self.live_dt_s = dt
         self.live_encoder_rpm = encoder_rpm
         snapshot_tach_rpm = float(snapshot.get("tach0_rpm", float("nan")))
         if record and self.current_mode() in (1, 2) and self.data["meas"]:
@@ -1019,7 +1021,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.instrument["raw_count"].append(raw_count)
         self.instrument["display_count"].append(display_count)
         self.instrument["delta_count"].append(display_delta)
-        self.instrument["dt_s"].append(interval_s)
+        self.instrument["dt_s"].append(dt)
         self.instrument["student_angle"].append(float("nan") if self.live_student_angle is None else self.live_student_angle)
         self.instrument["student_rpm"].append(float("nan") if self.live_student_rpm is None else self.live_student_rpm)
         self.instrument["encoder_rpm"].append(encoder_rpm)
