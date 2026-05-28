@@ -1028,7 +1028,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
                 del values[: len(values) - max_samples]
 
     def _direction_sign(self) -> float:
-        return -1.0 if self.encoder_direction.currentIndex() == 1 else 1.0
+        return -1.0 if self.encoder_direction.currentIndex() == 0 else 1.0
 
     def _display_scale(self) -> float:
         mode = self.encoder_edge_mode.currentIndex()
