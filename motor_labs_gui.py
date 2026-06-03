@@ -853,7 +853,10 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             widget.setSuffix("")
             widget.lineEdit().clear()
         elif isinstance(widget, QtWidgets.QCheckBox):
-            widget.setChecked(False)
+            if widget is self.auto_reference:
+                widget.setChecked(self.current_lab().automatic_reference)
+            else:
+                widget.setChecked(False)
 
     def _restore_spin_suffix(self, widget) -> None:
         suffix = widget.property("persistent_suffix")
@@ -915,7 +918,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             self.instrument_tabs.setCurrentIndex(0)
         else:
             self.settings_tabs.setCurrentIndex(0)
-        self.results.setPlainText("Lab selected. Fill the editable fields or use values loaded from saved settings.")
+        self.results.setPlainText("Lab selected. Empty fields use the lab defaults until you enter saved values.")
         self._update_axis_labels()
 
     def _index_for_value(self, options, value: int) -> int:
@@ -930,11 +933,36 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
     def current_mode(self) -> int:
         idx = self.mode_combo.currentIndex()
-        return MODE_OPTIONS[idx][1] if 0 <= idx < len(MODE_OPTIONS) else 0
+        return MODE_OPTIONS[idx][1] if 0 <= idx < len(MODE_OPTIONS) else self.current_lab().mode
 
     def current_signal(self) -> int:
         idx = self.signal_combo.currentIndex()
-        return SIGNAL_OPTIONS[idx][1] if 0 <= idx < len(SIGNAL_OPTIONS) else 0
+        return SIGNAL_OPTIONS[idx][1] if 0 <= idx < len(SIGNAL_OPTIONS) else self.current_lab().signal
+
+    def _spin_or_default(self, key: str, spin: QtWidgets.QSpinBox, default: int) -> int:
+        if key not in self._persistent_values and not spin.lineEdit().text().strip():
+            return int(default)
+        return int(spin.value())
+
+    def _double_or_default(self, key: str, spin: QtWidgets.QDoubleSpinBox, default: float) -> float:
+        if key not in self._persistent_values and not spin.lineEdit().text().strip():
+            return float(default)
+        return float(spin.value())
+
+    def _combo_index_or_default(self, combo: QtWidgets.QComboBox, default: int) -> int:
+        idx = combo.currentIndex()
+        return idx if idx >= 0 else int(default)
+
+    def _checkbox_or_default(self, key: str, checkbox: QtWidgets.QCheckBox, default: bool) -> bool:
+        if key not in self._persistent_values:
+            return bool(default)
+        return bool(checkbox.isChecked())
+
+    def _current_delay_ms(self) -> int:
+        return self._spin_or_default("sample_time_ms", self.delay, self.current_lab().delay_ms)
+
+    def _current_duration_s(self) -> int:
+        return self._spin_or_default("duration_s", self.duration, int(round(self.current_lab().duration_s)))
 
     def connect_hardware(self) -> None:
         if self.qube is not None and getattr(self.qube, "is_open", False):
@@ -953,7 +981,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return
         self.connect_button.setEnabled(False)
         self.release_button.setEnabled(True)
-        self.timer.setInterval(max(5, self.delay.value()))
+        self.timer.setInterval(max(5, self._current_delay_ms()))
         self.timer.start()
         self.status_label.setText("Quanser Qube connected; encoder monitor is active")
 
@@ -984,7 +1012,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self._update_axis_labels()
         self.output_tabs.setCurrentIndex(0)
         self._send_command(start=True)
-        self.timer.setInterval(max(5, self.delay.value()))
+        self.timer.setInterval(max(5, self._current_delay_ms()))
         self.timer.start()
         self.status_label.setText("Running lab; Qube output is enabled")
 
@@ -1001,7 +1029,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         if self.qube is not None:
-            self.timer.setInterval(max(5, self.delay.value()))
+            self.timer.setInterval(max(5, self._current_delay_ms()))
             self.timer.start()
             self.status_label.setText("Stopped; motor output is disabled")
 
@@ -1028,29 +1056,31 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
     def _command_values(self, start: bool) -> list[float | int]:
         lab = self.current_lab()
-        coeffs = [spin.value() for spin in self.coeff_spins]
+        coeffs = [
+            self._double_or_default(f"discrete_{chr(ord('A') + idx)}", spin, lab.coefficients[idx])
+            for idx, spin in enumerate(self.coeff_spins)
+        ]
         active_tab = 8 if lab.active_tab == 8 else 5
-        pid_index = self.pid_form.currentIndex()
-        pid_index = pid_index if pid_index >= 0 else 0
+        pid_index = self._combo_index_or_default(self.pid_form, lab.pid_type)
         return [
             1 if start else 0,
             self.current_mode(),
             *coeffs,
-            self.delay.value(),
-            self.period.value(),
-            self.amplitude.value(),
-            self.manual_reference.value(),
-            self.offset.value(),
+            self._current_delay_ms(),
+            self._spin_or_default("period_ms", self.period, lab.period_ms),
+            self._spin_or_default("amplitude", self.amplitude, lab.amplitude),
+            self._spin_or_default("manual_reference", self.manual_reference, lab.manual_reference),
+            self._spin_or_default("offset", self.offset, lab.offset),
             self.current_signal(),
             active_tab,
-            self.kp.value(),
-            self.ki.value(),
-            self.kd.value(),
-            self.deadzone.value(),
-            self.derivative_filter.value(),
+            self._double_or_default("kp", self.kp, lab.kp),
+            self._double_or_default("ki", self.ki, lab.ki),
+            self._double_or_default("kd", self.kd, lab.kd),
+            self._spin_or_default("deadzone", self.deadzone, lab.deadzone),
+            self._double_or_default("derivative_filter", self.derivative_filter, 0.2),
             pid_index,
-            1 if self.auto_reference.isChecked() else 0,
-            self.reset_time.value(),
+            1 if self._checkbox_or_default("automatic_reference", self.auto_reference, lab.automatic_reference) else 0,
+            self._double_or_default("reset_time", self.reset_time, 0.5),
         ]
 
     def _send_command(self, start: bool) -> None:
@@ -1082,7 +1112,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         if self.running:
             self._update_plots()
         self._refresh_instrumentation_display()
-        if self.running and self.elapsed_s >= self.duration.value():
+        if self.running and self.elapsed_s >= self._current_duration_s():
             self.stop_lab()
             self.analyze_current_lab()
 
