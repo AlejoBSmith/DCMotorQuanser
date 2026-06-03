@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import json
 import math
 import sys
 import time
@@ -211,6 +212,10 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.backend_factory = backend_factory
         self.qube = None
         self.running = False
+        self.settings_path = Path(__file__).with_name("motor_labs_settings.json")
+        self._loading_settings = True
+        self._persistent_values = self._read_persistent_settings()
+        self._persistent_widgets = {}
         self.elapsed_s = 0.0
         self.last_model = None
         self.last_analysis_text = ""
@@ -241,9 +246,12 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(900, 560)
         self._build_ui()
         self._apply_style()
+        self._register_persistent_controls()
         self._connect_signals()
         self.lab_list.setCurrentRow(0)
         self._select_lab(0)
+        self._apply_persistent_settings()
+        self._loading_settings = False
 
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -615,7 +623,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             "No filter",
         ])
         self.filter_window = self._spin(1, 201, 9)
-        self.filter_median_window = QtWidgets.QLineEdit("9")
+        self.filter_median_window = QtWidgets.QLineEdit()
+        self.filter_median_window.setPlaceholderText("samples")
         self.filter_median_window.setValidator(QtGui.QIntValidator(1, 201, self))
         self.filter_alpha = self._double_spin(0.001, 1.0, 0.2, decimals=4, step=0.01)
         self.filter_cutoff = self._double_spin(0.01, 1000.0, 50.0, decimals=3, step=1.0)
@@ -718,6 +727,139 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             """
         )
 
+    def _read_persistent_settings(self) -> dict:
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        values = data.get("values", data)
+        return values if isinstance(values, dict) else {}
+
+    def _write_persistent_settings(self) -> None:
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as fh:
+                json.dump({"values": self._persistent_values}, fh, indent=2, sort_keys=True)
+        except OSError as exc:
+            self.status_label.setText(f"Could not save settings: {exc}")
+
+    def _register_persistent_controls(self) -> None:
+        self._persistent_widgets = {
+            "mode": self.mode_combo,
+            "signal": self.signal_combo,
+            "automatic_reference": self.auto_reference,
+            "duration_s": self.duration,
+            "sample_time_ms": self.delay,
+            "period_ms": self.period,
+            "amplitude": self.amplitude,
+            "offset": self.offset,
+            "manual_reference": self.manual_reference,
+            "deadzone": self.deadzone,
+            "kp": self.kp,
+            "ki": self.ki,
+            "kd": self.kd,
+            "derivative_filter": self.derivative_filter,
+            "reset_time": self.reset_time,
+            "pid_form": self.pid_form,
+            "encoder_count_mode": self.encoder_edge_mode,
+            "encoder_direction": self.encoder_direction,
+            "encoder_cpr": self.encoder_cpr,
+            "angle_formula": self.encoder_formula,
+            "speed_formula": self.speed_formula,
+            "filter_source": self.filter_source,
+            "filter_type": self.filter_type,
+            "moving_average_window": self.filter_window,
+            "moving_median_window": self.filter_median_window,
+            "iir_alpha": self.filter_alpha,
+            "cutoff_rad_s": self.filter_cutoff,
+        }
+        for idx, spin in enumerate(self.coeff_spins):
+            self._persistent_widgets[f"discrete_{chr(ord('A') + idx)}"] = spin
+
+    def _connect_persistent_signals(self) -> None:
+        for key, widget in self._persistent_widgets.items():
+            if isinstance(widget, QtWidgets.QLineEdit):
+                widget.textChanged.connect(lambda _text, item_key=key: self._save_persistent_control(item_key))
+            elif isinstance(widget, QtWidgets.QComboBox):
+                widget.currentIndexChanged.connect(lambda _idx, item_key=key: self._save_persistent_control(item_key))
+            elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                widget.valueChanged.connect(lambda _value, item_key=key: self._save_persistent_control(item_key))
+            elif isinstance(widget, QtWidgets.QCheckBox):
+                widget.toggled.connect(lambda _checked, item_key=key: self._save_persistent_control(item_key))
+
+    def _apply_persistent_settings(self) -> None:
+        for key, widget in self._persistent_widgets.items():
+            if key in self._persistent_values:
+                self._write_control_value(widget, self._persistent_values[key])
+            else:
+                self._blank_control(widget)
+
+    def _save_persistent_control(self, key: str) -> None:
+        if self._loading_settings:
+            return
+        widget = self._persistent_widgets.get(key)
+        if widget is None:
+            return
+        value = self._read_control_value(widget)
+        if value is None:
+            self._persistent_values.pop(key, None)
+        else:
+            self._persistent_values[key] = value
+        self._write_persistent_settings()
+
+    def _read_control_value(self, widget):
+        if isinstance(widget, QtWidgets.QLineEdit):
+            text = widget.text().strip()
+            return text if text else None
+        if isinstance(widget, QtWidgets.QComboBox):
+            return widget.currentText() if widget.currentIndex() >= 0 else None
+        if isinstance(widget, QtWidgets.QSpinBox):
+            if not widget.lineEdit().text().strip():
+                return None
+            self._restore_spin_suffix(widget)
+            return int(widget.value())
+        if isinstance(widget, QtWidgets.QDoubleSpinBox):
+            if not widget.lineEdit().text().strip():
+                return None
+            self._restore_spin_suffix(widget)
+            return float(widget.value())
+        if isinstance(widget, QtWidgets.QCheckBox):
+            return bool(widget.isChecked())
+        return None
+
+    def _write_control_value(self, widget, value) -> None:
+        if isinstance(widget, QtWidgets.QLineEdit):
+            widget.setText(str(value))
+        elif isinstance(widget, QtWidgets.QComboBox):
+            idx = widget.findText(str(value))
+            widget.setCurrentIndex(idx)
+        elif isinstance(widget, QtWidgets.QSpinBox):
+            self._restore_spin_suffix(widget)
+            widget.setValue(int(value))
+        elif isinstance(widget, QtWidgets.QDoubleSpinBox):
+            self._restore_spin_suffix(widget)
+            widget.setValue(float(value))
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(bool(value))
+
+    def _blank_control(self, widget) -> None:
+        if isinstance(widget, QtWidgets.QLineEdit):
+            widget.clear()
+        elif isinstance(widget, QtWidgets.QComboBox):
+            widget.setCurrentIndex(-1)
+        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            widget.setSuffix("")
+            widget.lineEdit().clear()
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            widget.setChecked(False)
+
+    def _restore_spin_suffix(self, widget) -> None:
+        suffix = widget.property("persistent_suffix")
+        if suffix is not None and widget.suffix() != suffix:
+            widget.setSuffix(str(suffix))
+
     def _connect_signals(self) -> None:
         self.lab_list.currentRowChanged.connect(self._select_lab)
         self.connect_button.clicked.connect(self.connect_hardware)
@@ -741,12 +883,14 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.filter_median_window.textChanged.connect(self._refresh_filter_display)
         self.filter_alpha.valueChanged.connect(self._refresh_filter_display)
         self.filter_cutoff.valueChanged.connect(self._refresh_filter_display)
+        self._connect_persistent_signals()
 
     def _spin(self, minimum: int, maximum: int, value: int, suffix: str = "") -> QtWidgets.QSpinBox:
         spin = QtWidgets.QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(value)
         spin.setSuffix(suffix)
+        spin.setProperty("persistent_suffix", suffix)
         return spin
 
     def _double_spin(self, minimum: float, maximum: float, value: float, decimals: int, step: float) -> QtWidgets.QDoubleSpinBox:
@@ -755,6 +899,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         spin.setValue(value)
         spin.setDecimals(decimals)
         spin.setSingleStep(step)
+        spin.setProperty("persistent_suffix", "")
         return spin
 
     def _select_lab(self, row: int) -> None:
@@ -762,22 +907,6 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return
         lab = LABS[row]
         self.goal_text.setPlainText(lab.goal)
-        self.mode_combo.setCurrentIndex(self._index_for_value(MODE_OPTIONS, lab.mode))
-        self.signal_combo.setCurrentIndex(self._index_for_value(SIGNAL_OPTIONS, lab.signal))
-        self.duration.setValue(int(round(lab.duration_s)))
-        self.delay.setValue(lab.delay_ms)
-        self.period.setValue(lab.period_ms)
-        self.amplitude.setValue(lab.amplitude)
-        self.offset.setValue(lab.offset)
-        self.manual_reference.setValue(lab.manual_reference)
-        self.auto_reference.setChecked(lab.automatic_reference)
-        self.kp.setValue(lab.kp)
-        self.ki.setValue(lab.ki)
-        self.kd.setValue(lab.kd)
-        self.pid_form.setCurrentIndex(lab.pid_type)
-        self.deadzone.setValue(lab.deadzone)
-        for spin, value in zip(self.coeff_spins, lab.coefficients):
-            spin.setValue(value)
         if lab.analysis == "filtering":
             self.settings_tabs.setCurrentIndex(3)
             self.instrument_tabs.setCurrentIndex(1)
@@ -786,7 +915,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             self.instrument_tabs.setCurrentIndex(0)
         else:
             self.settings_tabs.setCurrentIndex(0)
-        self.results.setPlainText("Preset loaded. Connect the Qube and press Start when ready.")
+        self.results.setPlainText("Lab selected. Fill the editable fields or use values loaded from saved settings.")
         self._update_axis_labels()
 
     def _index_for_value(self, options, value: int) -> int:
@@ -800,10 +929,12 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         return LABS[row]
 
     def current_mode(self) -> int:
-        return MODE_OPTIONS[self.mode_combo.currentIndex()][1]
+        idx = self.mode_combo.currentIndex()
+        return MODE_OPTIONS[idx][1] if 0 <= idx < len(MODE_OPTIONS) else 0
 
     def current_signal(self) -> int:
-        return SIGNAL_OPTIONS[self.signal_combo.currentIndex()][1]
+        idx = self.signal_combo.currentIndex()
+        return SIGNAL_OPTIONS[idx][1] if 0 <= idx < len(SIGNAL_OPTIONS) else 0
 
     def connect_hardware(self) -> None:
         if self.qube is not None and getattr(self.qube, "is_open", False):
@@ -899,6 +1030,8 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         lab = self.current_lab()
         coeffs = [spin.value() for spin in self.coeff_spins]
         active_tab = 8 if lab.active_tab == 8 else 5
+        pid_index = self.pid_form.currentIndex()
+        pid_index = pid_index if pid_index >= 0 else 0
         return [
             1 if start else 0,
             self.current_mode(),
@@ -915,7 +1048,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             self.kd.value(),
             self.deadzone.value(),
             self.derivative_filter.value(),
-            self.pid_form.currentIndex(),
+            pid_index,
             1 if self.auto_reference.isChecked() else 0,
             self.reset_time.value(),
         ]
@@ -1171,7 +1304,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return values
         clean = np.nan_to_num(values, nan=0.0)
         filter_name = self.filter_type.currentText()
-        if filter_name == "No filter":
+        if not filter_name or filter_name == "No filter":
             return clean.copy()
         if filter_name == "Moving average":
             return self._moving_average(clean, self.filter_window.value())
@@ -1459,27 +1592,69 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             ] if line]
         )
 
-    def _step_segment(self, t, ref, meas):
+    def _step_segment_info(self, t, ref, meas):
         if t.size < 5:
+            return None
+        ref_span = float(np.ptp(ref))
+        ref_level = float(np.max(np.abs(ref))) if ref.size else 0.0
+        change_threshold = max(1.0, 0.1 * max(ref_span, ref_level))
+        changes = np.where(np.abs(np.diff(ref)) > change_threshold)[0]
+        bounds = [0, *[int(idx) + 1 for idx in changes], t.size]
+        candidates = []
+        for idx in range(len(bounds) - 1):
+            start = bounds[idx]
+            end = bounds[idx + 1]
+            if end - start < 5:
+                continue
+            u_after = float(np.median(ref[start:end]))
+            if idx == 0:
+                u_before = 0.0 if abs(u_after) > change_threshold else float(ref[start])
+            else:
+                prev_start = bounds[idx - 1]
+                u_before = float(np.median(ref[prev_start:start]))
+            du = u_after - u_before
+            if abs(du) <= change_threshold:
+                continue
+            ts = t[start:end] - t[start]
+            ys = meas[start:end]
+            if ts.size < 5 or np.ptp(ys) < 1.0:
+                continue
+            final_nonzero = 1 if abs(u_after) > change_threshold else 0
+            duration = float(ts[-1] - ts[0]) if ts.size else 0.0
+            candidates.append(
+                {
+                    "score": (final_nonzero, duration, abs(du)),
+                    "t": ts,
+                    "u": ref[start:end],
+                    "y": ys,
+                    "u0": u_before,
+                    "uss": u_after,
+                    "du": du,
+                    "start": start,
+                    "end": end,
+                }
+            )
+        if not candidates:
+            return None
+        return max(candidates, key=lambda item: item["score"])
+
+    def _step_segment(self, t, ref, meas):
+        info = self._step_segment_info(t, ref, meas)
+        if info is None:
             return t, ref, meas
-        change = np.where(np.abs(np.diff(ref)) > max(1.0, 0.1 * np.ptp(ref)))[0]
-        if change.size:
-            start = max(0, int(change[0]) + 1)
-        else:
-            start = 0
-        end = t.size
-        if change.size > 1:
-            end = max(start + 5, int(change[1]) + 1)
-        return t[start:end] - t[start], ref[start:end], meas[start:end]
+        return info["t"], info["u"], info["y"]
 
     def _estimate_first_order_step(self, t, ref, meas):
-        ts, rs, ys = self._step_segment(t, ref, meas)
+        info = self._step_segment_info(t, ref, meas)
+        if info is None:
+            return None
+        ts = info["t"]
+        ys = info["y"]
+        du = float(info["du"])
         if ts.size < 5:
             return None
         y0 = float(ys[0])
         yss = float(np.median(ys[max(1, int(0.8 * ys.size)) :]))
-        u0 = float(rs[0])
-        du = u0 if abs(u0) > 1e-9 else float(np.max(np.abs(rs)))
         gain = (yss - y0) / du if abs(du) > 1e-9 else 0.0
         target = y0 + 0.632 * (yss - y0)
         if yss >= y0:
@@ -1487,7 +1662,17 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         else:
             idx = np.where(ys <= target)[0]
         tau = float(ts[idx[0]]) if idx.size else float(max(ts[-1] / 3.0, 1e-3))
-        return {"K": gain, "tau": max(tau, 1e-3), "y0": y0, "yss": yss, "t": ts, "y": ys}
+        return {
+            "K": gain,
+            "tau": max(tau, 1e-3),
+            "y0": y0,
+            "yss": yss,
+            "u0": float(info["u0"]),
+            "uss": float(info["uss"]),
+            "du": du,
+            "t": ts,
+            "y": ys,
+        }
 
     def _analyze_step(self, t, ref, meas) -> str:
         model = self._estimate_first_order_step(t, ref, meas)
@@ -1505,6 +1690,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         return "\n".join(
             [
                 "First-order step estimate",
+                f"Input step: {model['u0']:.3f} to {model['uss']:.3f} PWM",
                 f"DC gain K: {model['K']:.5g} RPM/PWM",
                 f"Time constant tau: {model['tau']:.5g} s",
                 f"Initial value: {model['y0']:.3f} RPM",
@@ -1576,6 +1762,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             return "Need more samples for parameter estimation."
         dt = np.diff(t, prepend=t[0])
         dt[0] = float(np.median(dt[1:])) if dt.size > 1 else 0.02
+        median_dt = float(np.median(dt[dt > 0])) if np.any(dt > 0) else 0.02
         u = np.asarray(u, dtype=float)
         y = np.asarray(y, dtype=float)
 
@@ -1585,19 +1772,30 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             out = np.empty_like(y)
             out[0] = y0
             for k in range(1, y.size):
-                alpha = min(max(dt[k] / tau, 0.0), 1.0)
+                alpha = 1.0 - math.exp(-max(dt[k], 0.0) / tau)
                 out[k] = out[k - 1] + alpha * (gain * u[k - 1] - out[k - 1])
             return out
 
         step_guess = self._estimate_first_order_step(t, u, y)
         if step_guess is None:
-            x0 = np.array([0.5, 0.25, y[0]], dtype=float)
+            u_scale = float(np.max(np.abs(u))) if u.size else 1.0
+            y_scale = float(np.max(np.abs(y))) if y.size else 1.0
+            gain_guess = y_scale / max(u_scale, 1e-6)
+            x0 = np.array([gain_guess, 0.25, y[0]], dtype=float)
+            steady_input = float(np.median(u[-max(3, u.size // 5) :]))
         else:
             x0 = np.array([step_guess["K"], step_guess["tau"], step_guess["y0"]], dtype=float)
-        result = least_squares(lambda p: simulate(p) - y, x0=x0, max_nfev=3000)
+            steady_input = float(step_guess["uss"])
+        min_tau = max(median_dt, 1e-3)
+        max_tau = max(float(t[-1] - t[0]) * 2.0, min_tau * 10.0)
+        y_margin = max(float(np.ptp(y)), 1.0)
+        lower = np.array([-1000.0, min_tau, float(np.min(y) - y_margin)], dtype=float)
+        upper = np.array([1000.0, max_tau, float(np.max(y) + y_margin)], dtype=float)
+        x0 = np.minimum(np.maximum(x0, lower + 1e-9), upper - 1e-9)
+        result = least_squares(lambda p: simulate(p) - y, x0=x0, bounds=(lower, upper), max_nfev=3000)
         gain, tau, y0 = result.x
         tau = abs(float(tau))
-        model = {"K": float(gain), "tau": tau, "y0": float(y0), "yss": float(gain * np.median(u[-max(3, u.size // 5) :]))}
+        model = {"K": float(gain), "tau": tau, "y0": float(y0), "yss": float(gain * steady_input), "uss": steady_input}
         self.last_model = model
         yhat = simulate(result.x)
         rmse = float(np.sqrt(np.mean((yhat - y) ** 2)))
@@ -1608,6 +1806,7 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             [
                 "Least-squares first-order estimate",
                 f"Model: G(s) = {gain:.5g} / ({tau:.5g}s + 1)",
+                f"Estimated steady-state at {steady_input:.3f} PWM: {model['yss']:.3f} RPM",
                 f"Initial condition y0: {y0:.5g}",
                 f"Fit RMSE: {rmse:.5g} RPM",
                 f"Optimizer status: {result.message}",
