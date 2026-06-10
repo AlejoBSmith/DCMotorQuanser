@@ -1,8 +1,11 @@
 {
   "values": {
     "encoder_count_mode": "Quadrature x4 (HIL raw)",
+    "encoder_cpr": "2048",
     "encoder_direction": "Hardware sign",
-    "mode": "Open-loop motor command",
-    "signal": "PRBS"
+    "kp": 500.0,
+    "mode": "Speed control",
+    "signal": "PRBS",
+    "speed_formula": "delta_counts*60/dt/cpr"
   }
 }

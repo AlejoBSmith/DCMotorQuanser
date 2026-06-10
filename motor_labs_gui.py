@@ -338,18 +338,23 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.reset_time = self._double_spin(0.000001, 10, 0.5, decimals=5, step=0.01)
         self.pid_form = QtWidgets.QComboBox()
         self.pid_form.addItems(["Incremental", "Positional"])
-        for row, (label, widget) in enumerate(
-            [
-                ("Kp", self.kp),
-                ("Ki", self.ki),
-                ("Kd", self.kd),
-                ("D filter", self.derivative_filter),
-                ("Reset time", self.reset_time),
-                ("PID form", self.pid_form),
-            ]
-        ):
+        controller_rows = [
+            ("Kp", self.kp),
+            ("Ki", self.ki),
+            ("Kd", self.kd),
+            ("D filter", self.derivative_filter),
+            ("Reset time", self.reset_time),
+            ("PID form", self.pid_form),
+        ]
+        for row, (label, widget) in enumerate(controller_rows):
             controller_layout.addWidget(QtWidgets.QLabel(label), row, 0)
             controller_layout.addWidget(widget, row, 1)
+        self.stability_gain_note = QtWidgets.QLabel(
+            "Stability/Routh-Hurwitz: vary Kp. Ki and Kd are not included in this calculation."
+        )
+        self.stability_gain_note.setWordWrap(True)
+        self.stability_gain_note.setStyleSheet("color: #475569;")
+        controller_layout.addWidget(self.stability_gain_note, len(controller_rows), 0, 1, 2)
         self.settings_tabs.addTab(self._scroll_page(controller_box), "Controller")
 
         coeff_box = QtWidgets.QGroupBox("Discrete A-H")
@@ -517,6 +522,12 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         <p><b>Reset time</b>: anti-windup reset time used by the backend PID.</p>
         <p><b>PID form</b>: positional or incremental PID implementation.</p>
         <p><b>A-H</b>: coefficients for the discrete difference-equation controller.</p>
+
+        <h3>Stability analysis</h3>
+        <p><b>Open-loop mode</b>: analyzes the motor speed plant and the motor position plant without controller gain.</p>
+        <p><b>Speed control mode</b>: analyzes the continuous proportional speed loop. Vary <b>Kp</b> in the Controller tab.</p>
+        <p><b>Position control mode</b>: analyzes the continuous proportional position loop. Vary <b>Kp</b> in the Controller tab.</p>
+        <p><b>Ki and Kd</b>: ignored by the Routh-Hurwitz calculation shown in the Stability lab.</p>
 
         <h3>Filtering variables</h3>
         <p><b>Source</b>: signal used as filter input; either encoder-differentiated speed or tachometer speed.</p>
@@ -717,6 +728,37 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             QPushButton:disabled {
                 color: #94a3b8;
                 background: #f1f5f9;
+            }
+            QTabWidget::pane {
+                border: 1px solid #cbd5e1;
+                background: #f8fafc;
+                top: -1px;
+            }
+            QTabBar::tab {
+                color: #0f172a;
+                background: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-bottom-color: #cbd5e1;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                padding: 6px 12px;
+                margin-right: 2px;
+                min-width: 64px;
+            }
+            QTabBar::tab:selected {
+                color: #020617;
+                background: #ffffff;
+                border-color: #cbd5e1;
+                border-bottom-color: #ffffff;
+                font-weight: 600;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #eef2ff;
+                color: #0f172a;
+            }
+            QTabBar::tab:disabled {
+                color: #64748b;
+                background: #e2e8f0;
             }
             QListWidget, QTextEdit, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
                 background: #ffffff;
@@ -935,6 +977,13 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         idx = self.mode_combo.currentIndex()
         return MODE_OPTIONS[idx][1] if 0 <= idx < len(MODE_OPTIONS) else self.current_lab().mode
 
+    def _mode_label(self, mode: int | None = None) -> str:
+        selected_mode = self.current_mode() if mode is None else mode
+        for label, value in MODE_OPTIONS:
+            if value == selected_mode:
+                return label
+        return "Unknown"
+
     def current_signal(self) -> int:
         idx = self.signal_combo.currentIndex()
         return SIGNAL_OPTIONS[idx][1] if 0 <= idx < len(SIGNAL_OPTIONS) else self.current_lab().signal
@@ -963,6 +1012,14 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
 
     def _current_duration_s(self) -> int:
         return self._spin_or_default("duration_s", self.duration, int(round(self.current_lab().duration_s)))
+
+    def _current_kp(self) -> float:
+        return self._double_or_default("kp", self.kp, self.current_lab().kp)
+
+    def _current_kp_source(self) -> str:
+        if "kp" not in self._persistent_values and not self.kp.lineEdit().text().strip():
+            return "lab default"
+        return "user/saved value"
 
     def connect_hardware(self) -> None:
         if self.qube is not None and getattr(self.qube, "is_open", False):
@@ -1868,6 +1925,35 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
             ]
         )
 
+    def _format_pole(self, pole: complex) -> str:
+        real = float(np.real(pole))
+        imag = float(np.imag(pole))
+        if abs(imag) < 1e-9:
+            return f"{real:.5g}"
+        sign = "+" if imag >= 0 else "-"
+        return f"{real:.5g} {sign} {abs(imag):.5g}j"
+
+    def _format_poles(self, poles) -> str:
+        return ", ".join(self._format_pole(pole) for pole in poles)
+
+    def _plot_stability_poles(self, poles, title: str) -> None:
+        poles = np.asarray(poles, dtype=complex)
+        self.analysis_plot.clear()
+        self.analysis_plot.setLabel("bottom", "Real axis", units="rad/s")
+        self.analysis_plot.setLabel("left", "Imag axis", units="rad/s")
+        self.analysis_plot.addLine(x=0.0, pen=pg.mkPen("#94a3b8", width=1))
+        self.analysis_plot.addLine(y=0.0, pen=pg.mkPen("#94a3b8", width=1))
+        self.analysis_plot.plot(
+            np.real(poles),
+            np.imag(poles),
+            name=title,
+            pen=None,
+            symbol="x",
+            symbolSize=12,
+            symbolBrush="#dc2626",
+            symbolPen=pg.mkPen("#dc2626", width=2),
+        )
+
     def _analyze_stability(self, t, ref, meas) -> str:
         model = self._ensure_model(t, ref, meas)
         if model is None:
@@ -1875,18 +1961,83 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.last_model = model
         k = model["K"]
         tau = model["tau"]
-        kp = self.kp.value()
-        a0 = 1.0 + k * kp
-        stable = tau > 0 and a0 > 0
-        return "\n".join(
-            [
-                "Routh-Hurwitz check for speed proportional loop",
-                f"Characteristic polynomial: {tau:.5g}s + {a0:.5g}",
-                f"Closed-loop pole: {-a0 / tau:.5g} rad/s",
-                f"Stable: {'yes' if stable else 'no'}",
-                "For this first-order approximation, all polynomial coefficients must have the same sign.",
-            ]
-        )
+        kp = self._current_kp()
+        mode = self.current_mode()
+        mode_label = self._mode_label(mode)
+        kp_note = f"Gain to vary for controller stability tests: Kp in the Controller tab ({self._current_kp_source()})."
+        ideal_note = "This is the continuous ideal-model result; sampling, saturation, and delays are not included."
+
+        if mode in (0, 1):
+            speed_pole = -1.0 / tau
+            position_poles = np.array([0.0, speed_pole], dtype=float)
+            self._plot_stability_poles(position_poles, "Open-loop poles")
+            return "\n".join(
+                [
+                    "Open-loop plant stability",
+                    f"Selected mode: {mode_label}",
+                    "Controller gain used: none.",
+                    f"Speed plant: Omega(s)/PWM(s) = {k:.5g} / ({tau:.5g}s + 1)",
+                    f"Speed characteristic polynomial: {tau:.5g}s + 1",
+                    f"Speed pole: {speed_pole:.5g} rad/s",
+                    f"Speed BIBO stable: {'yes' if tau > 0 else 'no'}",
+                    f"Position plant: Theta(s)/PWM(s) = {6.0 * k:.5g} / (s({tau:.5g}s + 1))",
+                    f"Position characteristic polynomial: {tau:.5g}s^2 + s",
+                    f"Position poles: {self._format_poles(position_poles)}",
+                    "Position BIBO stable: no; a bounded nonzero voltage can produce an unbounded angle ramp.",
+                    "Use this mode to compare the open-loop speed and position plant stability from their poles.",
+                ]
+            )
+
+        if mode == 2:
+            a0 = 1.0 + k * kp
+            pole = -a0 / tau
+            stable = tau > 0 and a0 > 0
+            critical = -1.0 / k if abs(k) > 1e-12 else float("nan")
+            self._plot_stability_poles([pole], "Speed-loop pole")
+            return "\n".join(
+                [
+                    "Routh-Hurwitz check: proportional speed loop",
+                    f"Selected mode: {mode_label}",
+                    kp_note,
+                    f"Effective Kp: {kp:.5g}",
+                    f"Plant model: Omega(s)/PWM(s) = {k:.5g} / ({tau:.5g}s + 1)",
+                    f"Characteristic polynomial: {tau:.5g}s + {a0:.5g}",
+                    f"Closed-loop pole: {pole:.5g} rad/s",
+                    f"Routh-Hurwitz condition: tau > 0 and 1 + K*Kp > 0",
+                    f"Critical boundary: Kp > {critical:.5g}" if np.isfinite(critical) else "Critical boundary: undefined because K is zero",
+                    f"Stable: {'yes' if stable else 'no'}",
+                    "Ki and Kd are ignored in this calculation.",
+                    ideal_note,
+                ]
+            )
+
+        if mode == 3:
+            position_gain = 6.0 * k
+            a2 = tau
+            a1 = 1.0
+            a0 = position_gain * kp
+            poles = np.roots([a2, a1, a0])
+            stable = a2 > 0 and a1 > 0 and a0 > 0 and bool(np.all(np.real(poles) < 0.0))
+            self._plot_stability_poles(poles, "Position-loop poles")
+            return "\n".join(
+                [
+                    "Routh-Hurwitz check: proportional position loop",
+                    f"Selected mode: {mode_label}",
+                    kp_note,
+                    f"Effective Kp: {kp:.5g}",
+                    f"Speed plant model: Omega(s)/PWM(s) = {k:.5g} / ({tau:.5g}s + 1)",
+                    f"Position plant model: Theta(s)/PWM(s) = {position_gain:.5g} / (s({tau:.5g}s + 1))",
+                    f"Characteristic polynomial: {a2:.5g}s^2 + {a1:.5g}s + {a0:.5g}",
+                    f"Closed-loop poles: {self._format_poles(poles)}",
+                    "Routh-Hurwitz condition: tau > 0, 1 > 0, and 6*K*Kp > 0",
+                    f"Stable: {'yes' if stable else 'no'}",
+                    "The factor 6 converts speed gain from RPM/PWM to deg/s/PWM for the position plant.",
+                    "Ki and Kd are ignored in this calculation.",
+                    ideal_note,
+                ]
+            )
+
+        return f"Unsupported mode for stability analysis: {mode_label}"
 
     def _analyze_root_locus(self, t, ref, meas) -> str:
         model = self._ensure_model(t, ref, meas)
@@ -1900,14 +2051,15 @@ class MotorLabsWindow(QtWidgets.QMainWindow):
         self.analysis_plot.setLabel("bottom", "Real axis", units="rad/s")
         self.analysis_plot.setLabel("left", "Imag axis", units="rad/s")
         self.analysis_plot.plot(poles, np.zeros_like(poles), name="Speed-loop locus", pen=None, symbol="o", symbolSize=5, symbolBrush="#2563eb")
-        selected_pole = -(1.0 + k * self.kp.value()) / tau
+        current_kp = self._current_kp()
+        selected_pole = -(1.0 + k * current_kp) / tau
         self.analysis_plot.plot([selected_pole], [0.0], name="Current Kp", pen=None, symbol="x", symbolSize=12, symbolBrush="#dc2626")
         return "\n".join(
             [
                 "Root-locus sweep for first-order speed model",
                 f"Plant model: G(s) = {k:.5g} / ({tau:.5g}s + 1)",
                 "Gain sweep: Kp = 0 to 5",
-                f"Current Kp: {self.kp.value():.5g}",
+                f"Current Kp: {current_kp:.5g} ({self._current_kp_source()})",
                 f"Current closed-loop pole: {selected_pole:.5g} rad/s",
             ]
         )
